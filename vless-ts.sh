@@ -7,7 +7,7 @@ export LANG=en_US.UTF-8
 [ -z "${argo+x}" ] || agp=yes
 
 v46url="https://icanhazip.com"
-REPO_URL="https://github.com/yourname/vless-ts"
+REPO_URL="https://github.com/zv201413/vless-ts"
 
 showmode(){
 echo "=================================================="
