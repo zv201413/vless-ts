@@ -61,9 +61,27 @@ JSON
 # --- 6. 启动与链接输出 ---
 pkill -f xray
 nohup ./xray -c config.json > xray.log 2>&1 &
-sleep 3
-DOMAIN=$(grep -oE 'https://[a-z0-9.-]+\.trycloudflare\.com' argo.log | tail -n 1 | sed 's/https:\/\///')
-ADDRESS=${DOMAIN:-$(curl -s4 icanhazip.com)}
+
+echo "正在等待 Argo 隧道分配域名 (最多等待 30 秒)..."
+ITERATION=0
+DOMAIN=""
+while [ -z "$DOMAIN" ] && [ $ITERATION -lt 15 ]; do
+    sleep 2
+    DOMAIN=$(grep -oE 'https://[a-z0-9.-]+\.trycloudflare\.com' argo.log | tail -n 1 | sed 's/https:\/\///')
+    ITERATION=$((ITERATION+1))
+done
+
+if [ -n "$DOMAIN" ]; then
+    ADDRESS=$DOMAIN
+    PORT_LINK=443
+    SEC="tls"
+else
+    ADDRESS=$(curl -s4 icanhazip.com)
+    PORT_LINK=8003
+    SEC="none"
+    echo "警告：Argo 隧道启动超时，切换至 IP 直连模式。"
+fi
+
 echo -e "\n--- 部署完成 (WARP: ${warp:-n}) ---"
 echo "节点链接："
-echo "vless://8e6290c1-b97e-40c0-b9a3-7e7ed11ce248@$ADDRESS:$( [ -n "$DOMAIN" ] && echo "443" || echo "8003" )?encryption=none&security=$( [ -n "$DOMAIN" ] && echo "tls" || echo "none" )&sni=$ADDRESS&type=ws&host=$ADDRESS&path=%2Fws#Argo-VLESS"
+echo "vless://8e6290c1-b97e-40c0-b9a3-7e7ed11ce248@$ADDRESS:$PORT_LINK?encryption=none&security=$SEC&sni=$ADDRESS&type=ws&host=$ADDRESS&path=%2Fws#Argo-VLESS"
