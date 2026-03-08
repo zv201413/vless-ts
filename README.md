@@ -41,7 +41,7 @@ curl -Ls "https://raw.githubusercontent.com/zv201413/vls_ws_ag/refs/heads/main/r
 
 ### 【1. 隧道后台运行】
 ```
-nohup ./cloudflared tunnel --url http://localhost:8003 --protocol quic --no-autoupdate > argo.log 2>&1 &
+nohup /home/zv/vless-all/cloudflared tunnel --url http://localhost:8003 --protocol quic --no-autoupdate > /home/zv/vless-all/argo.log 2>&1 &
 ```
 ### 【2. xray后台运行】
 ```
