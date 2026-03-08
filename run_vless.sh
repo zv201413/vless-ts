@@ -1,82 +1,60 @@
 #!/bin/bash
 
-# --- 1. 配置与变量 ---
+# --- 1. 环境准备 ---
 WORK_DIR="/home/zv/vless-all"
-UUID="8e6290c1-b97e-40c0-b9a3-7e7ed11ce248"
-PORT=8003
-
-# --- 2. 卸载函数 (核心新增) ---
-do_uninstall() {
-    echo "--- 正在启动卸载程序 ---"
-    # 停止所有相关进程
-    pkill -f xray
-    pkill -f cloudflared
-    # 删除工作目录
-    if [ -d "$WORK_DIR" ]; then
-        rm -rf "$WORK_DIR"
-        echo "已清理工作目录: $WORK_DIR"
-    fi
-    # 清理临时文件
-    rm -f /tmp/priv
-    echo "--- 卸载完成！所有服务已停止 ---"
-    exit 0
-}
-
-# --- 3. 参数判断 ---
-# 如果执行命令带了 uninstall 参数，则直接跳到卸载逻辑
-if [ "$1" = "uninstall" ]; then
-    do_uninstall
-fi
-
-# --- 4. 安装/更新逻辑 (之前的 79Mbps 极速版) ---
 mkdir -p $WORK_DIR
 cd $WORK_DIR
 
-# 自动安装依赖
-if ! command -v wg >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1; then
-    apt-get update && apt-get install -y wireguard-tools curl unzip jq
+# --- 2. 自动下载 cloudflared (新增逻辑) ---
+if [ ! -f "cloudflared" ]; then
+    echo "正在下载 cloudflared..."
+    curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+    chmod +x cloudflared
 fi
 
-# 检查并下载 Xray
+# 启动临时隧道 (如果没在跑的话)
+if ! pgrep -f cloudflared >/dev/null; then
+    echo "正在启动 Argo 隧道..."
+    nohup ./cloudflared tunnel --url http://localhost:8003 --no-autoupdate > argo.log 2>&1 &
+    sleep 5 # 等待隧道分配域名
+fi
+
+# --- 3. 下载 Xray ---
 if [ ! -f "xray" ]; then
-    arch=$(uname -m)
-    case $arch in
-        x86_64) plat="64" ;;
-        aarch64) plat="arm64-v8a" ;;
-        *) plat="64" ;;
-    esac
-    curl -L -o xray.zip "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-$plat.zip"
-    unzip -o xray.zip && rm xray.zip && chmod +x xray
+    curl -L -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+    unzip -o xray.zip && chmod +x xray
 fi
 
-# --- 5. WARP 注册逻辑 ---
-generate_warp_conf() {
-    echo "正在自动获取 WARP 账户信息..."
-    priv_key=$(./xray x25519 | head -n 1 | cut -d ' ' -f 3)
-    pub_key=$(echo "$priv_key" | ./xray x25519 | tail -n 1 | cut -d ' ' -f 3)
-    auth=$(curl -sX POST "https://api.cloudflareclient.com/v0a1922/reg" -H "Content-Type: application/json" -d '{"install_id":"","tos":"2020-01-22T00:00:00.000Z","key":"'$pub_key'","fcm_token":""}')
-    W_PRIV="$priv_key"
-    W_V6=$(echo "$auth" | grep -oE '"v6":"[^"]+"' | cut -d'"' -f4)
-    W_ID=$(echo "$auth" | grep -oE '"id":"[^"]+"' | cut -d'"' -f4)
-    W_TOKEN=$(echo "$auth" | grep -oE '"token":"[^"]+"' | cut -d'"' -f4)
-    W_RES=$(curl -sX GET "https://api.cloudflareclient.com/v0a1922/reg/$W_ID" -H "Authorization: Bearer $W_TOKEN" | grep -oE '"reserved":\[[0-9, ]+\]' | cut -d: -f2)
-}
-
-# --- 6. 组装配置 ---
+# --- 4. WARP 注册 (改进了提取方式，不依赖 jq) ---
 if [ "$warp" = "y" ]; then
-    generate_warp_conf
-    OUTBOUND_JSON='{ "protocol": "wireguard", "settings": { "secretKey": "'$W_PRIV'", "address": ["172.16.0.2/32", "'$W_V6'/128"], "peers": [{ "publicKey": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=", "endpoint": "engage.cloudflareclient.com:2408" }], "reserved": '$W_RES' } }'
+    echo "正在自动获取 WARP 账户信息..."
+    priv_key=$(./xray x25519 | head -n 1 | awk '{print $3}')
+    pub_key=$(echo "$priv_key" | ./xray x25519 | tail -n 1 | awk '{print $3}')
+    
+    # 模拟注册
+    auth=$(curl -sX POST "https://api.cloudflareclient.com/v0a1922/reg" -H "Content-Type: application/json" -d '{"install_id":"","tos":"2020-01-22T00:00:00.000Z","key":"'$pub_key'","fcm_token":""}')
+    
+    # 使用 sed 提取，防止没有 jq 的情况
+    W_V6=$(echo "$auth" | sed 's/.*"v6":"\([^"]*\)".*/\1/')
+    W_ID=$(echo "$auth" | sed 's/.*"id":"\([^"]*\)".*/\1/')
+    W_TOKEN=$(echo "$auth" | sed 's/.*"token":"\([^"]*\)".*/\1/')
+    
+    # 获取 Reserved
+    res_raw=$(curl -sX GET "https://api.cloudflareclient.com/v0a1922/reg/$W_ID" -H "Authorization: Bearer $W_TOKEN")
+    W_RES=$(echo "$res_raw" | grep -oP '"reserved":\[\K[^\]]+')
+    
+    OUTBOUND_JSON='{ "protocol": "wireguard", "settings": { "secretKey": "'$priv_key'", "address": ["172.16.0.2/32", "'$W_V6'/128"], "peers": [{ "publicKey": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=", "endpoint": "engage.cloudflareclient.com:2408" }], "reserved": ['$W_RES'] } }'
 else
     OUTBOUND_JSON='{ "protocol": "freedom", "settings": { "domainStrategy": "UseIP" } }'
 fi
 
-# --- 7. 写入并启动 ---
+# --- 5. 写入配置并重启 ---
 cat << JSON > config.json
 {
   "log": { "loglevel": "warning" },
   "inbounds": [{
-    "port": $PORT, "protocol": "vless",
-    "settings": { "clients": [{"id": "$UUID"}], "decryption": "none" },
+    "port": 8003, "protocol": "vless",
+    "settings": { "clients": [{"id": "8e6290c1-b97e-40c0-b9a3-7e7ed11ce248"}], "decryption": "none" },
     "streamSettings": { "network": "ws", "wsSettings": { "path": "/ws" } }
   }],
   "outbounds": [$OUTBOUND_JSON]
@@ -84,16 +62,20 @@ cat << JSON > config.json
 JSON
 
 pkill -f xray
-nohup ./xray -c config.json > /dev/null 2>&1 &
+nohup ./xray -c config.json > xray.log 2>&1 &
 
-# --- 8. 输出链接 ---
-# 提取 Argo 域名逻辑
-DOMAIN=$(grep -oE 'https://[a-z0-9.-]+\.trycloudflare\.com' $WORK_DIR/argo.log 2>/dev/null | tail -n 1 | sed 's/https:\/\///')
-if [ -n "$DOMAIN" ] && pgrep -f cloudflared >/dev/null; then
-    ADDRESS=$DOMAIN; REAL_PORT=443; SEC="tls"
+# --- 6. 生成链接 ---
+DOMAIN=$(grep -oE 'https://[a-z0-9.-]+\.trycloudflare\.com' argo.log | tail -n 1 | sed 's/https:\/\///')
+if [ -z "$DOMAIN" ]; then
+    ADDRESS=$(curl -s4m5 icanhazip.com)
+    PORT_LINK=8003
+    SEC="none"
 else
-    ADDRESS=$(curl -s4m5 icanhazip.com); REAL_PORT=$PORT; SEC="none"
+    ADDRESS=$DOMAIN
+    PORT_LINK=443
+    SEC="tls"
 fi
 
-echo -e "\n节点链接："
-echo "vless://$UUID@$ADDRESS:$REAL_PORT?encryption=none&security=$SEC&sni=$ADDRESS&type=ws&host=$ADDRESS&path=%2Fws#Argo-VLESS-Final"
+echo -e "\n--- 部署完成 ---"
+echo "节点链接："
+echo "vless://8e6290c1-b97e-40c0-b9a3-7e7ed11ce248@$ADDRESS:$PORT_LINK?encryption=none&security=$SEC&sni=$ADDRESS&type=ws&host=$ADDRESS&path=%2Fws#Argo-VLESS"
