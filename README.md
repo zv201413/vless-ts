@@ -53,9 +53,14 @@ curl -Ls "https://raw.githubusercontent.com/zv201413/vls_ws_ag/refs/heads/main/r
 
 > [!NOTE]
 > **手动维护命令：**
-> - **Argo 隧道运行**：`nohup ./cloudflared tunnel --url http://localhost:8003 --protocol quic --no-autoupdate > ./argo.log 2>&1 &`
-> - **Xray 核心运行**：`nohup ./xray -c ./config.json > ./xray.log 2>&1 &`
-
+> - **Argo 隧道运行**：
+```bash
+nohup ./cloudflared tunnel --url http://localhost:8003 --protocol quic --no-autoupdate > ./argo.log 2>&1 &
+```
+> - **Xray 核心运行**：
+```bash
+nohup ./xray -c ./config.json > ./xray.log 2>&1 &
+```
 ---
 
 ## 四、 常见问题 (FAQ)
