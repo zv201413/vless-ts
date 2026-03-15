@@ -4,6 +4,8 @@
 WORK_DIR="/home/zv/vless-all"
 mkdir -p "$WORK_DIR"
 cd "$WORK_DIR"
+# UUID 动态获取：优先使用环境变量，否则随机生成
+USER_UUID=${UUID:-$(cat /proc/sys/kernel/random/uuid)}
 
 # --- 2. 卸载功能 ---
 if [ "$1" = "uninstall" ]; then
@@ -22,28 +24,29 @@ echo "检查运行环境..."
 chmod +x cloudflared xray
 
 # --- 4. WARP 密钥与策略构建 ---
-# 默认直连
 OUTBOUNDS_JSON='{ "protocol": "freedom", "tag": "direct", "settings": { "domainStrategy": "UseIP" } }'
 ROUTING_RULE='{ "type": "field", "outboundTag": "direct", "network": "tcp,udp" }'
 
 if [ "$warp" = "y" ]; then
-    echo "正在尝试获取云端 WARP 密钥..."
-    warp_raw=$(curl -sL "https://warp.xijp.eu.org")
-    
-    if [ -n "$warp_raw" ] && ! echo "$warp_raw" | grep -q "html"; then
-        pvk=$(echo "$warp_raw" | grep "Private_key" | awk -F'：' '{print $2}' | tr -d ' \r')
-        wpv6=$(echo "$warp_raw" | grep "IPV6" | awk -F'：' '{print $2}' | tr -d ' \r')
-        res=$(echo "$warp_raw" | grep "reserved" | awk -F'：' '{print $2}' | tr -d '[] \r')
-        echo "已从云端提取最新密钥"
+    if [ -n "$MY_WARP_DATA" ]; then
+        echo "检测到环境变量 MY_WARP_DATA，正在解析..."
+        warp_raw="$MY_WARP_DATA"
     else
-        # 使用你提供的兜底配置
-        echo "云端获取失败，应用指定的兜底配置..."
+        echo "正在尝试从云端获取 WARP 密钥..."
+        warp_raw=$(curl -sL -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" "https://warp.xijp.eu.org")
+    fi
+    
+    if echo "$warp_raw" | grep -qE "Private_key|私钥"; then
+        pvk=$(echo "$warp_raw" | grep -E "Private_key|私钥" | awk -F'[：:]' '{print $2}' | tr -d ' \r')
+        wpv6=$(echo "$warp_raw" | grep -E "IPV6|地址" | awk -F'[：:]' '{print $2}' | tr -d ' \r')
+        res=$(echo "$warp_raw" | grep -E "reserved|值" | awk -F'[：:]' '{print $2}' | tr -d '[] \r')
+        [ -z "$pvk" ] && pvk=$(echo "$warp_raw" | grep -oE '[A-Za-z0-9+/]{43}=' | head -n 1)
+    else
         pvk='sBbO/ohZrLRoSFRaQCciqyiRFHwbxZ88nlDO5vNmD2I='
         wpv6='2606:4700:110:8515:e070:6396:54b0:15ba'
         res='0, 0, 0'
     fi
 
-    # 构建 V6 优先的 WARP 出站结构
     OUTBOUNDS_JSON='
     {
       "tag": "x-warp-out",
@@ -60,70 +63,62 @@ if [ "$warp" = "y" ]; then
       }
     },
     {
-      "tag": "warp-v6-out",
+      "tag": "warp-out",
       "protocol": "freedom",
-      "settings": { "domainStrategy": "ForceIPv6" },
+      "settings": { "domainStrategy": "ForceIPv6v4" },
       "proxySettings": { "tag": "x-warp-out" }
     },
-    {
-      "tag": "direct",
-      "protocol": "freedom",
-      "settings": { "domainStrategy": "UseIPv4" }
-    }'
+    { "tag": "direct", "protocol": "freedom", "settings": { "domainStrategy": "UseIPv4" } }'
     
-    ROUTING_RULE='{ "type": "field", "outboundTag": "warp-v6-out", "network": "tcp,udp" }'
-    echo "WARP IPv6 优先配置已就绪"
+    ROUTING_RULE='{ "type": "field", "outboundTag": "warp-out", "network": "tcp,udp" }'
 fi
 
-# --- 5. 生成 Xray 配置文件 ---
+# --- 5. 生成配置文件 ---
 cat << JSON > config.json
 {
   "log": { "loglevel": "warning" },
   "inbounds": [{
     "port": 8003,
+    "listen": "0.0.0.0",
     "protocol": "vless",
     "settings": {
-      "clients": [{"id": "8e6290c1-b97e-40c0-b9a3-7e7ed11ce248"}],
+      "clients": [{"id": "$USER_UUID"}],
       "decryption": "none"
     },
     "streamSettings": {
       "network": "ws",
       "wsSettings": { "path": "/ws" }
-    },
-    "sniffing": {
-      "enabled": true,
-      "destOverride": ["http", "tls", "quic"]
     }
   }],
   "outbounds": [$OUTBOUNDS_JSON],
-  "routing": {
-    "domainStrategy": "IPOnDemand",
-    "rules": [$ROUTING_RULE]
-  }
+  "routing": { "domainStrategy": "IPOnDemand", "rules": [$ROUTING_RULE] }
 }
 JSON
 
-# --- 6. 启动进程 ---
-echo "正在重启服务..."
+# --- 6. 启动服务 ---
 pkill -f xray
 pkill -f cloudflared
 rm -f argo.log && touch argo.log
-
 nohup ./xray -c config.json > xray.log 2>&1 &
 nohup ./cloudflared tunnel --url http://localhost:8003 --no-autoupdate > argo.log 2>&1 &
 
-# --- 7. 获取域名与链接 ---
-echo "等待域名分配..."
-ITERATION=0
+# --- 7. 获取域名与自动标签命名 ---
+echo "正在分配域名并检测地理位置..."
 DOMAIN=""
-while [ -z "$DOMAIN" ] && [ $ITERATION -lt 15 ]; do
+for i in {1..15}; do
     sleep 2
-    if [ -f "argo.log" ]; then
-        DOMAIN=$(grep -oE 'https://[a-z0-9.-]+\.trycloudflare\.com' argo.log | tail -n 1 | sed 's/https:\/\///')
-    fi
-    ITERATION=$((ITERATION+1))
+    [ -f "argo.log" ] && DOMAIN=$(grep -oE 'https://[a-z0-9.-]+\.trycloudflare\.com' argo.log | tail -n 1 | sed 's/https:\/\///')
+    [ -n "$DOMAIN" ] && break
     echo -n "."
 done
+
+# 自动获取国家代码 (例如 US, HK)
+COUNTRY=$(curl -s https://ipapi.co/country_code/ || echo "Unknown")
+
+# 拼接备注标签
+REMARK="Argo"
+[ "$warp" = "y" ] && REMARK="${REMARK}-WARP"
+REMARK="${REMARK}-${COUNTRY}"
 
 if [ -n "$DOMAIN" ]; then
     ADDRESS=$DOMAIN
@@ -133,10 +128,9 @@ else
     ADDRESS=$(curl -s4 icanhazip.com)
     PORT_LINK=8003
     SEC="none"
-    echo -e "\n[!] Argo 隧道分配失败，已回退至 IP 直连。"
 fi
 
 echo -e "\n--- 部署成功 ---"
-echo "WARP 状态: ${warp:-n}"
+echo "UUID: $USER_UUID"
 echo "节点链接 (点击复制)："
-echo "vless://8e6290c1-b97e-40c0-b9a3-7e7ed11ce248@$ADDRESS:$PORT_LINK?encryption=none&security=$SEC&sni=$ADDRESS&type=ws&host=$ADDRESS&path=%2Fws#Argo-WARP-IPv6"
+echo "vless://$USER_UUID@$ADDRESS:$PORT_LINK?encryption=none&security=$SEC&sni=$ADDRESS&type=ws&host=$ADDRESS&path=%2Fws#$REMARK"
